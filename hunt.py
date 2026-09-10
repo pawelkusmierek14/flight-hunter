@@ -51,6 +51,12 @@ def next_departure_dates(count: int, horizon_days: int = 120) -> list[str]:
     return out
 
 
+def return_date_for(depart: str, trip_length_days: int) -> str:
+    """Given a depart date (dd/mm/yyyy), the return date that many days later."""
+    d = datetime.strptime(depart, "%d/%m/%Y").date()
+    return (d + timedelta(days=trip_length_days)).strftime("%d/%m/%Y")
+
+
 def render_table(payload: dict, limit: int = 10) -> str:
     items = [i for i in payload.get("itineraries", []) if i.get("price") is not None]
     if not items:
@@ -109,8 +115,9 @@ def cmd_scan(args) -> int:
 
     for dest, depart in picks:
         tried += 1
+        ret = return_date_for(depart, args.trip_length) if args.round_trip else None
         try:
-            payload = kiwi.search_flight(ORIGIN, dest, depart, flex_days=3)
+            payload = kiwi.search_flight(ORIGIN, dest, depart, return_date=ret, flex_days=3)
         except kiwi.KiwiError as exc:
             errors.append(f"{dest}@{depart}: {exc}")
             continue
@@ -121,16 +128,18 @@ def cmd_scan(args) -> int:
             continue
         ok += 1
 
-        trip_type = "oneway"
+        # A round trip is a genuinely different product from a one-way, so it
+        # gets its own trip_type and therefore its own price history.
+        trip_type = "roundtrip" if best.get("inbound") else "oneway"
         seg = (best.get("outbound", {}).get("segments") or [{}])[0]
         routing = kiwi.route_str(best)
 
         rows.append({
             "observed_at": store.utcnow(), "origin": ORIGIN, "destination": dest,
-            "depart_date": depart, "return_date": None, "trip_type": trip_type,
+            "depart_date": depart, "return_date": ret, "trip_type": trip_type,
             "price": float(best["price"]), "currency": payload.get("currency", "EUR"),
             "carrier": seg.get("carrierName"), "stops": best.get("outbound", {}).get("stops"),
-            "duration_s": best.get("outbound", {}).get("durationSeconds"),
+            "duration_s": best.get("totalDurationSeconds"),
             "booking_url": best.get("bookingUrl"), "routing": routing,
         })
 
@@ -138,7 +147,7 @@ def cmd_scan(args) -> int:
         prices = [r["price"] for r in hist]
         hit = anomaly.evaluate(
             prices, float(best["price"]), origin=ORIGIN, destination=dest,
-            depart_date=depart, currency=payload.get("currency", "EUR"),
+            depart_date=depart, return_date=ret, currency=payload.get("currency", "EUR"),
             booking_url=best.get("bookingUrl"), routing=routing,
         )
         if hit and not store.recent_alert_exists(store.DB_PATH, ORIGIN, dest, depart):
@@ -214,6 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("scan", help="sample routes, store history, detect anomalies")
     s.add_argument("--batch", type=int, default=6, help="how many routes this run")
     s.add_argument("--horizon", type=int, default=120, help="booking horizon in days")
+    s.add_argument("--round-trip", action="store_true",
+                   help="monitor round trips instead of one-ways")
+    s.add_argument("--trip-length", type=int, default=7,
+                   help="days between departure and return (with --round-trip)")
     s.add_argument("--dry-run", action="store_true", help="do not write to the DB")
     s.set_defaults(func=cmd_scan)
 

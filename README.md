@@ -41,12 +41,13 @@ cd /opt/data/flight-hunter
 
 # Tryb na żądanie — jedna trasa, wyniki na żywo
 python3 hunt.py find --to BKK --depart 09/12/2026 --flex 3
-python3 hunt.py find --to LIS --depart 15/10/2026 --return 22/10/2026
+python3 hunt.py find --to LIS --depart 15/10/2026 --return 22/10/2026   # z powrotem
 python3 hunt.py find --to Tokio --depart 01/03/2027 --json   # nazwy miast działają
 
 # Zbieranie historii + detekcja anomalii (to robi cron)
-python3 hunt.py scan --batch 10
-python3 hunt.py scan --batch 10 --dry-run     # bez zapisu do bazy
+python3 hunt.py scan --batch 10                              # w jedną stronę
+python3 hunt.py scan --batch 10 --round-trip --trip-length 7 # tam i z powrotem
+python3 hunt.py scan --batch 10 --dry-run                    # bez zapisu do bazy
 
 # Co wiemy
 python3 hunt.py report --top 30
@@ -55,7 +56,10 @@ python3 hunt.py stats
 
 ## Jak działa detekcja
 
-Dla każdej trasy (`origin → destination` + data wylotu) trzymamy historię cen.
+Dla każdej kombinacji **trasy + data wylotu + typu podróży** trzymamy historię cen.
+**Loty w jedną stronę i powrotne mają rozdzielne historie** — to różne produkty
+o różnych cenach, więc mieszanie ich zafałszowałoby baseline.
+
 Alert leci, gdy spełnione są **wszystkie** warunki:
 
 - cena jest **poniżej mediany** historii, oraz
@@ -71,8 +75,9 @@ Dedupe: ta sama trasa + data nie zaalarmuje dwa razy w ciągu 48h.
 
 ## Automatyzacja
 
-Cron `flight-hunter-scan` (job `6c1f2f02e829`) — **co 4 godziny**, batch 10 tras.
-Rotuje po liście z `routes.py`, więc w ciągu doby sprawdza ~60 tras.
+Cron `flight-hunter-scan` (job `6c1f2f02e829`) — **co 4 godziny**, dwa przebiegi:
+6 tras w jedną stronę + 6 tras powrotnych (wylot + 7 dni). Razem ~12 tras na cykl.
+Rotuje po liście z `routes.py`, więc w ciągu doby sprawdza ~70 tras.
 Alerty idą na Telegram; raport z każdego runa też.
 
 **Uwaga:** dopóki baza nie zbierze ~5 obserwacji na trasę (realnie ~2 tygodnie),
