@@ -1,0 +1,20 @@
+# Historia cen — Twoje dane, nie kod. Nie trafia do repo.
+flights.db
+flights.db-shm
+flights.db-wal
+*.db
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Lokalne sekrety (tokeny czytane z /opt/data/.env, ale na wszelki wypadek)
+.env
+*.env
+
+# Edytory / system
+.vscode/
+.idea/
+.DS_Store
+*.swp
