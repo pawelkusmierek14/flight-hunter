@@ -50,8 +50,10 @@ python3 hunt.py scan --batch 10 --round-trip --trip-length 7 # tam i z powrotem
 python3 hunt.py scan --batch 10 --dry-run                    # bez zapisu do bazy
 
 # Co wiemy
-python3 hunt.py report --top 30
-python3 hunt.py stats
+python3 hunt.py report --top 30                          # wszystkie typy
+python3 hunt.py report --top 20 --trip-type roundtrip    # tylko powrotne
+python3 hunt.py report --top 20 --trip-type oneway       # tylko w jedną stronę
+python3 hunt.py stats                                    # + rozbicie na typy
 ```
 
 ## Jak działa detekcja

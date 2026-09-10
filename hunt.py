@@ -174,23 +174,38 @@ def cmd_scan(args) -> int:
 
 def cmd_report(args) -> int:
     store.init()
+    where, params = "", []
+    if args.trip_type != "all":
+        where = "WHERE trip_type = ?"
+        params.append(args.trip_type)
+    params.append(args.top)
+
     with store.connect() as conn:
         rows = conn.execute(
-            """
-            SELECT origin, destination, depart_date, MIN(price) AS best, currency,
+            f"""
+            SELECT origin, destination, depart_date, return_date, trip_type,
+                   MIN(price) AS best, currency,
                    COUNT(*) AS samples, MAX(observed_at) AS last_seen
               FROM observations
-             GROUP BY origin, destination, depart_date
+              {where}
+             GROUP BY origin, destination, depart_date, return_date, trip_type
              ORDER BY best ASC LIMIT ?
             """,
-            (args.top,),
+            params,
         ).fetchall()
     if not rows:
         print("Brak danych — uruchom najpierw: python3 hunt.py scan")
         return 0
-    print(f"{'trasa':<16}{'data':<12}{'najtaniej':>10}{'n':>4}  ostatnio")
+
+    def trip_label(r) -> str:
+        return "tam/powrót" if r["trip_type"] == "roundtrip" else "w jedną"
+
+    print(f"{'trasa':<14}{'data wylotu':<22}{'typ':<11}{'najtaniej':>10}{'n':>4}  ostatnio")
     for r in rows:
-        print(f"{r['origin']+'→'+r['destination']:<16}{r['depart_date']:<12}"
+        dates = r["depart_date"]
+        if r["return_date"]:
+            dates += f" → {r['return_date']}"
+        print(f"{(r['origin']+'→'+r['destination']):<14}{dates:<22}{trip_label(r):<11}"
               f"{r['best']:>8.0f} {r['currency']:<3}{r['samples']:>4}  {r['last_seen'][:16]}")
     return 0
 
@@ -199,6 +214,21 @@ def cmd_stats(args) -> int:
     store.init()
     s = store.stats()
     print(json.dumps(s, indent=2, ensure_ascii=False))
+    with store.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT trip_type, COUNT(*) AS observations,
+                   COUNT(DISTINCT origin || destination || depart_date) AS route_shapes,
+                   MIN(price) AS cheapest, COUNT(DISTINCT destination) AS destinations
+              FROM observations GROUP BY trip_type ORDER BY trip_type
+            """
+        ).fetchall()
+    if rows:
+        print("\nwg typu podróży:")
+        for r in rows:
+            print(f"  {r['trip_type']:<10} {r['observations']:>4} obserwacji, "
+                  f"{r['route_shapes']:>3} tras, {r['destinations']:>3} kierunków, "
+                  f"najtaniej {r['cheapest']:.0f}")
     return 0
 
 
@@ -232,6 +262,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("report", help="cheapest known prices per route")
     r.add_argument("--top", type=int, default=20)
+    r.add_argument("--trip-type", dest="trip_type", default="all",
+                   choices=["all", "oneway", "roundtrip"],
+                   help="filter by trip type (default: all)")
     r.set_defaults(func=cmd_report)
 
     st = sub.add_parser("stats", help="database stats")
