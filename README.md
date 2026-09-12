@@ -1,102 +1,159 @@
 # Flight Hunter ✈️
 
-Agent do łowienia tanich lotów z Warszawy. Wykrywa **anomalie cenowe** —
-realne obniżki względem historii trasy, nie „tanio mi się wydaje".
+Track flight prices from a chosen origin, keep a real price history per route,
+and get alerted only when a fare drops **materially** below what that specific
+route normally costs — not when it merely looks cheap.
 
-## Skąd dane
+The whole point is the baseline. A 99 EUR fare to Rome is unremarkable in
+January and newsworthy in August; without history you cannot tell the two apart.
+Flight Hunter stores every observation, so the alert threshold is the route's own
+distribution: **median − 2σ**, and it refuses to judge at all until it has seen
+the route at least five times.
 
-Publiczny MCP server Kiwi.com: `https://mcp.kiwi.com`
+- **No API key, no signup, no cost.** Prices come from Kiwi.com's public MCP
+  server (`https://mcp.kiwi.com`), a JSON-RPC/SSE endpoint anyone can call.
+- **Standard library only.** No dependencies to install, pin, or rot — it runs
+  from a bare cron job.
+- **One-way and round-trip are tracked as separate products**, each with its own
+  history, because they are priced differently and mixing them corrupts the
+  baseline.
+- **Alert fatigue is treated as a bug**: a minimum saving, a statistical floor,
+  a minimum sample count, and a 48 h dedupe window all have to agree first.
 
-- **Bez klucza API, bez rejestracji, bez kosztów.**
-- Jedno narzędzie: `search-flight` — przelot w jedną stronę lub powrotny,
-  ±3 dni elastyczności, pasażerowie, klasa.
-- Zwraca prawdziwe ceny, czasy, przewoźników, przesiadki i **link do rezerwacji**.
+## Quick start
 
-### Dlaczego nie inne źródła (stan: wrzesień 2026)
+```bash
+git clone https://github.com/pawelkusmierek14/flight-hunter.git
+cd flight-hunter
 
-| Źródło | Status |
+# one live search, no database involved
+python3 hunt.py find --to BCN --depart 09/12/2026 --flex 3
+
+# round trip
+python3 hunt.py find --to LIS --depart 15/10/2026 --return 22/10/2026
+
+# offline sanity checks (no network, no writes)
+python3 hunt.py selftest
+python3 tests.py
+```
+
+To start collecting history:
+
+```bash
+python3 hunt.py scan --batch 10                    # one-ways
+python3 hunt.py scan --batch 10 --round-trip       # round trips, 7-day stays
+python3 hunt.py scan --batch 10 --dry-run          # don't write anything
+
+python3 hunt.py report --top 30                    # cheapest known per route
+python3 hunt.py report --trip-type roundtrip
+python3 hunt.py stats
+```
+
+Until a route has ~5 observations (about two weeks at the default cadence) the
+detector stays silent **by design**. That silence is the feature.
+
+## How it works
+
+```
+kiwi.py     Kiwi MCP client (JSON-RPC over SSE) — the only module that uses the network
+store.py    SQLite: observations, alerts, runs, plus the schema migration
+anomaly.py  the detector: median + standard deviation, and its thresholds
+notify.py   delivery: Telegram or a generic webhook
+config.py   watch list, origin, thresholds, cadence — everything tunable
+hunt.py     CLI: find / scan / report / stats / selftest
+tests.py    unit tests (stdlib unittest, no network)
+```
+
+### An alert requires all four conditions
+
+1. the price is **below the median** of that route's history, and
+2. it is at least **12% below** that median, and
+3. it sits at least **2σ** below it, and
+4. the history has at least **5 samples** to compare against.
+
+Median rather than mean, so one past flash sale cannot drag the baseline down and
+make every later fare look average. The sample-recording step excludes the
+just-recorded observation from its own comparison, otherwise the first sample
+would always look perfectly typical.
+
+Thresholds live in `config.py` (`MIN_SAMPLES`, `MIN_Z`, `MIN_PCT_BELOW`) and can
+also be overridden per call to `anomaly.evaluate()`.
+
+## Configuration
+
+`config.py` holds the origin, the destination pool the scan rotates through, the
+thresholds, batch size, booking horizon, and the alert dedupe window. Environment
+overrides exist for the things you change per deployment:
+
+| Variable | Purpose |
 |---|---|
-| Amadeus Self-Service | Zamknięte 17.07.2026 — tylko Enterprise |
-| Kiwi Tequila API | Od 2024 invite-only |
-| Travelpayouts / Aviasales Data API | Darmowe, ale dane cache'owane 48h; Search API wymaga 50k MAU |
-| Skyscanner / Duffel | Partnerstwo / KYC, progi MAU |
-| Scraping Google Flights | Szara strefa, łamie ToS — świadomie odrzucone |
+| `FLIGHT_HUNTER_ORIGIN` | Origin airport (default `WAW`) |
+| `FLIGHT_HUNTER_DB` | Path to the SQLite file |
+| `FLIGHT_HUNTER_MCP_URL` | Point at a different MCP server |
+| `FLIGHT_HUNTER_WEBHOOK_URL` | Deliver alerts to an HTTP endpoint |
+| `FLIGHT_HUNTER_ENV_FILE` | Explicit dotenv file to read credentials from |
 
-## Struktura
+### Alert delivery
 
-```
-kiwi.py       klient MCP (JSON-RPC 2.0 po SSE) — jedyne miejsce z siecią
-store.py      SQLite: observations, alerts, runs
-anomaly.py    detekcja anomalii (mediana + odchylenie standardowe)
-notify.py     wysyłka na Telegram (czyta TELEGRAM_* z .env Hermesa)
-routes.py     lista kierunków i lotnisko startowe
-hunt.py       CLI
-flights.db    historia obserwacji (tworzy się sama)
-```
-
-## Użycie
+Telegram is used when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` are set; a
+webhook (`{"text": ...}`) is used when `FLIGHT_HUNTER_WEBHOOK_URL` is set.
+Credentials are read from the environment first and from a dotenv file
+second — nothing is written back to disk and no token is ever logged. A failed
+delivery prints a warning and never aborts the scan.
 
 ```bash
-cd /opt/data/flight-hunter
-
-# Tryb na żądanie — jedna trasa, wyniki na żywo
-python3 hunt.py find --to BKK --depart 09/12/2026 --flex 3
-python3 hunt.py find --to LIS --depart 15/10/2026 --return 22/10/2026   # z powrotem
-python3 hunt.py find --to Tokio --depart 01/03/2027 --json   # nazwy miast działają
-
-# Zbieranie historii + detekcja anomalii (to robi cron)
-python3 hunt.py scan --batch 10                              # w jedną stronę
-python3 hunt.py scan --batch 10 --round-trip --trip-length 7 # tam i z powrotem
-python3 hunt.py scan --batch 10 --dry-run                    # bez zapisu do bazy
-
-# Co wiemy
-python3 hunt.py report --top 30                          # wszystkie typy
-python3 hunt.py report --top 20 --trip-type roundtrip    # tylko powrotne
-python3 hunt.py report --top 20 --trip-type oneway       # tylko w jedną stronę
-python3 hunt.py stats                                    # + rozbicie na typy
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_HOME_CHANNEL=...
+python3 hunt.py scan --batch 10
 ```
 
-## Jak działa detekcja
+### Scheduling
 
-Dla każdej kombinacji **trasy + data wylotu + typu podróży** trzymamy historię cen.
-**Loty w jedną stronę i powrotne mają rozdzielne historie** — to różne produkty
-o różnych cenach, więc mieszanie ich zafałszowałoby baseline.
+Any scheduler works; hourly-to-4-hourly is a reasonable cadence. From cron:
 
-Alert leci, gdy spełnione są **wszystkie** warunki:
+```cron
+0 */4 * * * cd /path/to/flight-hunter && /usr/bin/python3 hunt.py scan --batch 10 >> scan.log 2>&1
+```
 
-- cena jest **poniżej mediany** historii, oraz
-- spadek ≥ **12%** (materialna oszczędność, nie drgnięcie o kilka euro), oraz
-- odchylenie ≥ **2σ** (statystycznie wyjątkowe), oraz
-- mamy ≥ **5 próbek** historii (inaczej nie zgadujemy).
+The scan rotates through the destination pool using the ordinal date as a seed, so
+consecutive runs sample different routes and the whole list is covered over a day
+without hammering any single route.
 
-Mediana, nie średnia — pojedyncza flash-sale z przeszłości nie zaniży baseline'u.
+## Why Kiwi's MCP server
 
-Progi siedzą w `anomaly.py`: `MIN_SAMPLES`, `MIN_Z`, `MIN_PCT_BELOW`.
+| Source | Status (as of 2026) |
+|---|---|
+| Kiwi public MCP | Open, no key, real bookable prices — **used here** |
+| Amadeus Self-Service | Closed to new users July 2026, Enterprise only |
+| Kiwi Tequila | Invite-only since 2024 |
+| Travelpayouts / Aviasales | Free tier caches data for 48 h; Search API needs 50k MAU |
+| Skyscanner / Duffel | Partnership or KYC, MAU thresholds |
+| Scraping Google Flights | Grey area, breaks ToS — rejected deliberately |
 
-Dedupe: ta sama trasa + data nie zaalarmuje dwa razy w ciągu 48h.
-
-## Automatyzacja
-
-Cron `flight-hunter-scan` (job `6c1f2f02e829`) — **co 4 godziny**, dwa przebiegi:
-6 tras w jedną stronę + 6 tras powrotnych (wylot + 7 dni). Razem ~12 tras na cykl.
-Rotuje po liście z `routes.py`, więc w ciągu doby sprawdza ~70 tras.
-Alerty idą na Telegram; raport z każdego runa też.
-
-**Uwaga:** dopóki baza nie zbierze ~5 obserwacji na trasę (realnie ~2 tygodnie),
-detektor milczy z założenia. To nie błąd — to ochrona przed fałszywymi alarmami.
-
-## Kierunki
-
-`routes.py` → `DESTINATIONS`. Mieszanka krótkich weekendowych (BCN, LIS, ROM,
-ATH, TIA…) i długodystansowych (BKK, DPS, HND, SIN, NYC, GRU…).
-Dodaj własne — skaner sam je włączy do rotacji.
-
-## Rozwiązywanie problemów
+## Testing
 
 ```bash
-python3 hunt.py stats          # czy baza rośnie
-python3 hunt.py scan --batch 3 --dry-run   # czy sieć działa
+python3 tests.py        # 33 tests: detector boundaries, parsing, storage, CLI helpers
+python3 hunt.py selftest  # per-module offline self-checks
 ```
 
-Alert nie przyszedł na Telegram? Sprawdź `python3 -c "import notify; print(notify.telegram_available())"`.
-Brak historii? Sprawdź, czy cron ma status `scheduled` w `cronjob_manage action='list'`.
+Both run without network access and without touching a real database. The test
+suite deliberately focuses on the boundaries that decide whether an alert is
+trustworthy: too little history, an immaterial dip, a noisy baseline, a flat
+baseline, a contaminated sample, and round-trip/one-way separation.
+
+## Contributing
+
+Issues and pull requests are welcome. Two things keep the bar:
+
+- **Behaviour changes come with tests.** The detector's edge cases are the
+  product; a change to a threshold or a comparison should show up in `tests.py`.
+- **No new runtime dependencies** unless there is a strong argument — the
+  zero-dependency property is what makes the tool deployable from a cron job.
+
+Adding destinations is just editing `DESTINATIONS` in `config.py`; the scanner
+picks them up automatically.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

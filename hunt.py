@@ -1,11 +1,12 @@
 """Flight Hunter CLI.
 
 Usage:
-  python3 hunt.py find --from WAW --to Lisbon --depart 15/10/2026 [--return 22/10/2026]
-                       [--flex 3] [--cabin economy] [--json]
-  python3 hunt.py scan [--batch 6] [--dry-run]     # sample routes, store history, alert
-  python3 hunt.py report [--top 20]                # what we know so far
+  python3 hunt.py find --to Lisbon --depart 15/10/2026 [--return 22/10/2026]
+                       [--from WAW] [--flex 3] [--cabin economy] [--json]
+  python3 hunt.py scan [--batch 6] [--round-trip] [--dry-run]
+  python3 hunt.py report [--top 20] [--trip-type oneway|roundtrip|all]
   python3 hunt.py stats
+  python3 hunt.py selftest
 """
 
 from __future__ import annotations
@@ -18,6 +19,13 @@ from datetime import date, datetime, timedelta
 import anomaly
 import kiwi
 import store
+from config import (
+    ALERT_DEDUPE_HOURS,
+    DEFAULT_BATCH,
+    DEFAULT_HORIZON,
+    DEFAULT_TRIP_LENGTH,
+    FLEX_DAYS,
+)
 from notify import notify_anomalies
 from routes import DESTINATIONS, ORIGIN
 
@@ -40,7 +48,7 @@ def fmt_dt(iso: str | None) -> str:
         return iso
 
 
-def next_departure_dates(count: int, horizon_days: int = 120) -> list[str]:
+def next_departure_dates(count: int, horizon_days: int = DEFAULT_HORIZON) -> list[str]:
     """Spread departure dates across the booking horizon (dd/mm/yyyy)."""
     today = date.today()
     step = max(1, horizon_days // max(1, count))
@@ -58,13 +66,12 @@ def return_date_for(depart: str, trip_length_days: int) -> str:
 
 
 def render_table(payload: dict, limit: int = 10) -> str:
-    items = [i for i in payload.get("itineraries", []) if i.get("price") is not None]
+    items = kiwi.ranking(payload, limit=limit)
     if not items:
         return "Brak wyników."
-    items.sort(key=lambda i: i["price"])
     head = f"{payload.get('query', '')}\n"
     rows = []
-    for it in items[:limit]:
+    for it in items:
         seg = (it.get("outbound", {}).get("segments") or [{}])[0]
         rows.append(
             f"  {it['price']:>7.0f} {payload.get('currency', 'EUR')}  "
@@ -73,9 +80,8 @@ def render_table(payload: dict, limit: int = 10) -> str:
             f"{fmt_duration(it.get('outbound', {}).get('durationSeconds')):<7} "
             f"{seg.get('carrierName', '?')}"
         )
-    return head + "\n".join(rows) + "\n" + "\n".join(
-        f"    → {it.get('bookingUrl')}" for it in items[:limit]
-    )
+    links = "\n".join(f"    → {url}" for url in kiwi.booking_links(payload, limit=limit))
+    return head + "\n".join(rows) + ("\n" + links if links else "")
 
 
 # ── commands ──────────────────────────────────────────────────────────────
@@ -117,7 +123,8 @@ def cmd_scan(args) -> int:
         tried += 1
         ret = return_date_for(depart, args.trip_length) if args.round_trip else None
         try:
-            payload = kiwi.search_flight(ORIGIN, dest, depart, return_date=ret, flex_days=3)
+            payload = kiwi.search_flight(ORIGIN, dest, depart, return_date=ret,
+                                         flex_days=FLEX_DAYS)
         except kiwi.KiwiError as exc:
             errors.append(f"{dest}@{depart}: {exc}")
             continue
@@ -150,7 +157,9 @@ def cmd_scan(args) -> int:
             depart_date=depart, return_date=ret, currency=payload.get("currency", "EUR"),
             booking_url=best.get("bookingUrl"), routing=routing,
         )
-        if hit and not store.recent_alert_exists(store.DB_PATH, ORIGIN, dest, depart):
+        if hit and not store.recent_alert_exists(store.DB_PATH, ORIGIN, dest, depart,
+                                                 within_hours=ALERT_DEDUPE_HOURS,
+                                                 trip_type=trip_type):
             alerts.append(hit)
 
     if not args.dry_run:
@@ -166,7 +175,7 @@ def cmd_scan(args) -> int:
         delivered = notify_anomalies(alerts)
         for a in alerts:
             store.record_alert(store.DB_PATH, {**a.as_dict(), "notified": bool(delivered)})
-        print(f"  → wysłano {delivered}/{len(alerts)} alertów na Telegram")
+        print(f"  → wysłano {delivered}/{len(alerts)} alertów")
     for a in alerts:
         print("\n" + anomaly.format_alert(a))
     return 0
@@ -212,8 +221,7 @@ def cmd_report(args) -> int:
 
 def cmd_stats(args) -> int:
     store.init()
-    s = store.stats()
-    print(json.dumps(s, indent=2, ensure_ascii=False))
+    print(json.dumps(store.stats(), indent=2, ensure_ascii=False))
     with store.connect() as conn:
         rows = conn.execute(
             """
@@ -229,6 +237,17 @@ def cmd_stats(args) -> int:
             print(f"  {r['trip_type']:<10} {r['observations']:>4} obserwacji, "
                   f"{r['route_shapes']:>3} tras, {r['destinations']:>3} kierunków, "
                   f"najtaniej {r['cheapest']:.0f}")
+    return 0
+
+
+def cmd_selftest(args) -> int:
+    """Run every module's offline self-check. No network, no database writes."""
+    import notify
+
+    for module in (kiwi, anomaly, store, notify):
+        module._self_check()
+        print(f"  ok  {module.__name__}")
+    print("selftest: wszystkie sprawdzenia przeszły")
     return 0
 
 
@@ -251,11 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     f.set_defaults(func=cmd_find)
 
     s = sub.add_parser("scan", help="sample routes, store history, detect anomalies")
-    s.add_argument("--batch", type=int, default=6, help="how many routes this run")
-    s.add_argument("--horizon", type=int, default=120, help="booking horizon in days")
+    s.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="how many routes this run")
+    s.add_argument("--horizon", type=int, default=DEFAULT_HORIZON,
+                   help="booking horizon in days")
     s.add_argument("--round-trip", action="store_true",
                    help="monitor round trips instead of one-ways")
-    s.add_argument("--trip-length", type=int, default=7,
+    s.add_argument("--trip-length", type=int, default=DEFAULT_TRIP_LENGTH,
                    help="days between departure and return (with --round-trip)")
     s.add_argument("--dry-run", action="store_true", help="do not write to the DB")
     s.set_defaults(func=cmd_scan)
@@ -269,6 +289,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("stats", help="database stats")
     st.set_defaults(func=cmd_stats)
+
+    selft = sub.add_parser("selftest", help="offline self-checks, no network")
+    selft.set_defaults(func=cmd_selftest)
     return p
 
 

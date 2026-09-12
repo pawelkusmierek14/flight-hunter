@@ -12,7 +12,12 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flights.db")
+from config import DB_NAME
+
+DB_PATH = os.environ.get(
+    "FLIGHT_HUNTER_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME),
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS observations (
@@ -46,6 +51,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     z_score       REAL    NOT NULL,
     pct_below     REAL    NOT NULL,
     booking_url   TEXT,
+    trip_type     TEXT,
     notified      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -78,6 +84,36 @@ def connect(path: str = DB_PATH):
 def init(path: str = DB_PATH) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
+    return conn.execute(f"PRAGMA table_info({table})").fetchall()
+
+
+def _migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add columns that older databases predate. Idempotent.
+
+    An existing install keeps its price history; the schema only ever grows.
+    Returns the list of columns actually added, for reporting.
+    """
+    added: list[str] = []
+    wanted = {
+        "observations": {"return_date": "TEXT", "trip_type": "TEXT",
+                         "carrier": "TEXT", "stops": "INTEGER",
+                         "duration_s": "INTEGER", "booking_url": "TEXT",
+                         "routing": "TEXT"},
+        "alerts": {"trip_type": "TEXT"},
+    }
+    for table, columns in wanted.items():
+        existing = {row["name"] for row in _columns(conn, table)}
+        if not existing:
+            continue
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added.append(f"{table}.{name}")
+    return added
 
 
 def record(path: str, rows: list[dict]) -> int:
@@ -139,33 +175,41 @@ def record_alert(path: str, alert: dict) -> int:
         cur = conn.execute(
             """
             INSERT INTO alerts (sent_at, origin, destination, depart_date, return_date,
-                                price, baseline, z_score, pct_below, booking_url, notified)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                price, baseline, z_score, pct_below, booking_url,
+                                trip_type, notified)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 utcnow(), alert["origin"], alert["destination"], alert["depart_date"],
                 alert.get("return_date"), alert["price"], alert["baseline"],
                 alert["z_score"], alert["pct_below"], alert.get("booking_url"),
-                1 if alert.get("notified") else 0,
+                alert.get("trip_type"), 1 if alert.get("notified") else 0,
             ),
         )
         return int(cur.lastrowid)
 
 
 def recent_alert_exists(path: str, origin: str, destination: str, depart_date: str,
-                        within_hours: int = 48) -> bool:
-    """Dedupe: did we already alert on this exact route shape recently?"""
+                        within_hours: int = 48, trip_type: str | None = None) -> bool:
+    """Dedupe: did we already alert on this exact route shape recently?
+
+    One-way and round-trip fares for the same date are different products, so
+    trip_type can narrow the check. The alerts table predates that column, so
+    filtering on it is opt-in.
+    """
+    sql = """
+        SELECT 1 FROM alerts
+         WHERE origin=? AND destination=? AND depart_date=?
+           AND sent_at >= datetime('now', ?)
+    """
+    params: list = [origin, destination, depart_date, f"-{int(within_hours)} hours"]
+    if trip_type:
+        sql += " AND trip_type = ?"
+        params.append(trip_type)
+    sql += " LIMIT 1"
+
     with connect(path) as conn:
-        row = conn.execute(
-            """
-            SELECT 1 FROM alerts
-             WHERE origin=? AND destination=? AND depart_date=?
-               AND sent_at >= datetime('now', ?)
-             LIMIT 1
-            """,
-            (origin, destination, depart_date, f"-{int(within_hours)} hours"),
-        ).fetchone()
-        return row is not None
+        return conn.execute(sql, params).fetchone() is not None
 
 
 def stats(path: str = DB_PATH) -> dict:
@@ -179,3 +223,96 @@ def stats(path: str = DB_PATH) -> dict:
         last = conn.execute("SELECT MAX(observed_at) AS t FROM observations").fetchone()["t"]
     return {"observations": obs, "routes": routes, "alerts": alerts,
             "first_seen": first, "last_seen": last}
+
+
+def _self_check() -> None:
+    """Exercise the real storage layer against a throwaway database."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "test.db")
+        init(db)
+        assert stats(db)["observations"] == 0
+
+        rows = [
+            {"observed_at": utcnow(), "origin": "WAW", "destination": "BCN",
+             "depart_date": "01/03/2027", "return_date": None, "trip_type": "oneway",
+             "price": 120.0, "currency": "EUR", "carrier": "Ryanair", "stops": 0,
+             "duration_s": 10800, "booking_url": "https://example.test/a",
+             "routing": "WAW → BCN"},
+            {"observed_at": utcnow(), "origin": "WAW", "destination": "BCN",
+             "depart_date": "01/03/2027", "return_date": None, "trip_type": "oneway",
+             "price": 140.0, "currency": "EUR", "carrier": "Wizz", "stops": 0,
+             "duration_s": 10900, "booking_url": "https://example.test/b",
+             "routing": "WAW → BCN"},
+        ]
+        assert record(db, rows) == 2
+        assert record(db, []) == 0
+
+        hist = history(db, "WAW", "BCN", "oneway", "01/03/2027")
+        assert len(hist) == 2
+
+        # Round trips must not contaminate one-way history.
+        assert history(db, "WAW", "BCN", "roundtrip", "01/03/2027") == []
+        cheapest = cheapest_ever(db, "WAW", "BCN", "oneway", "01/03/2027")
+        assert cheapest is not None
+        assert cheapest["price"] == 120.0
+
+        run_id = start_run(db)
+        assert run_id == 1
+        finish_run(db, run_id, tried=2, ok=2)
+        assert stats(db)["routes"] == 1
+
+        assert not recent_alert_exists(db, "WAW", "BCN", "01/03/2027")
+
+    # Schema migration: a legacy alerts table (pre trip_type) must be upgraded.
+    with tempfile.TemporaryDirectory() as tmp:
+        db = os.path.join(tmp, "legacy.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("""
+                CREATE TABLE alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sent_at TEXT NOT NULL, origin TEXT NOT NULL,
+                    destination TEXT NOT NULL, depart_date TEXT NOT NULL,
+                    return_date TEXT, price REAL NOT NULL, baseline REAL NOT NULL,
+                    z_score REAL NOT NULL, pct_below REAL NOT NULL,
+                    booking_url TEXT, notified INTEGER NOT NULL DEFAULT 0
+                )""")
+            conn.execute(
+                "INSERT INTO alerts (sent_at, origin, destination, depart_date, price,"
+                " baseline, z_score, pct_below, notified) VALUES"
+                " (datetime('now'), 'WAW', 'BCN', '01/03/2027', 90.0, 130.0, 3.1, 0.3, 1)"
+            )
+        init(db)
+        with connect(db) as conn:
+            cols = {r["name"] for r in _columns(conn, "alerts")}
+        assert "trip_type" in cols
+        # The legacy row survives and stays visible to the untagged dedupe check.
+        assert recent_alert_exists(db, "WAW", "BCN", "01/03/2027")
+        assert stats(db)["alerts"] == 1
+
+        # A round-trip alert is not deduplicated against a one-way alert.
+        record_alert(db, {"origin": "WAW", "destination": "BCN",
+                          "depart_date": "01/03/2027", "return_date": None,
+                          "price": 500.0, "baseline": 700.0, "z_score": 2.5,
+                          "pct_below": 0.2857, "booking_url": None, "notified": True,
+                          "trip_type": "oneway"})
+        # The legacy (untagged) row must still suppress an untagged check…
+        assert recent_alert_exists(db, "WAW", "BCN", "01/03/2027")
+        assert recent_alert_exists(db, "WAW", "BCN", "01/03/2027", trip_type="oneway")
+        # …but a round-trip alert on the same shape is a separate decision.
+        assert not recent_alert_exists(db, "WAW", "BCN", "01/03/2027",
+                                       trip_type="roundtrip")
+        record_alert(db, {"origin": "WAW", "destination": "BCN",
+                          "depart_date": "01/03/2027", "return_date": None,
+                          "price": 90.0, "baseline": 130.0, "z_score": 3.1,
+                          "pct_below": 0.3077, "booking_url": None, "notified": True,
+                          "trip_type": "roundtrip"})
+        assert recent_alert_exists(db, "WAW", "BCN", "01/03/2027", trip_type="roundtrip")
+        assert not recent_alert_exists(db, "WAW", "BCN", "02/03/2027")
+        assert stats(db)["alerts"] == 3
+
+
+if __name__ == "__main__":
+    _self_check()
+    print("store.py self-check ok")
