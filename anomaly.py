@@ -8,18 +8,15 @@ is boring in January and remarkable in August.
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 
-# Minimum samples before a route's history is trustworthy enough to judge.
-MIN_SAMPLES = 5
-# How far below the baseline a price must sit to count as an anomaly.
-MIN_Z = 2.0
-# And it must also be a material saving, not a rounding wobble.
-MIN_PCT_BELOW = 0.12
+from config import BASELINE_METHOD, MIN_PCT_BELOW, MIN_SAMPLES, MIN_Z
 
 
 @dataclass
 class Anomaly:
+    """A price that is materially and statistically below its own history."""
+
     origin: str
     destination: str
     depart_date: str
@@ -38,7 +35,7 @@ class Anomaly:
         return asdict(self)
 
 
-def baseline(prices: list[float], method: str = "median") -> tuple[float, float]:
+def baseline(prices: list[float], method: str = BASELINE_METHOD) -> tuple[float, float]:
     """Return (central tendency, spread). Median is robust to past flash sales."""
     if method == "mean":
         centre = statistics.fmean(prices)
@@ -62,7 +59,7 @@ def evaluate(
     min_samples: int = MIN_SAMPLES,
     min_z: float = MIN_Z,
     min_pct_below: float = MIN_PCT_BELOW,
-    method: str = "median",
+    method: str = BASELINE_METHOD,
 ) -> Anomaly | None:
     """Judge `current` against `prices`. Returns an Anomaly if it qualifies.
 
@@ -111,3 +108,46 @@ def format_alert(a: Anomaly) -> str:
     if a.booking_url:
         lines.append(f"[Rezerwuj]({a.booking_url})")
     return "\n".join(lines)
+
+
+def _self_check() -> None:
+    """Boundary checks on the detector itself — the core thesis of this project."""
+    # Not enough history: silence beats a guess.
+    assert evaluate([100.0, 100.0], 50.0, origin="WAW", destination="BCN",
+                    depart_date="01/01/2027") is None
+
+    # A material drop against a stable history.
+    hit = evaluate([100.0] * 6, 70.0, origin="WAW", destination="BCN",
+                   depart_date="01/01/2027")
+    assert hit is not None and hit.pct_below == 0.3 and hit.samples == 6
+
+    # Below the percentage threshold: 5% off is not news.
+    assert evaluate([100.0] * 6, 95.0, origin="WAW", destination="BCN",
+                    depart_date="01/01/2027") is None
+
+    # A price above the baseline is never an anomaly, however noisy the history.
+    assert evaluate([100.0, 110.0, 90.0, 105.0, 95.0], 130.0,
+                    origin="WAW", destination="BCN", depart_date="01/01/2027") is None
+
+    # Flat history, real drop → spread 0 must not block the alert.
+    assert evaluate([200.0] * 5, 150.0, origin="WAW", destination="BCN",
+                    depart_date="01/01/2027") is not None
+
+    # The just-recorded sample must not dilute its own comparison.
+    noisy = [100.0] * 5 + [80.0]
+    assert evaluate(noisy, 80.0, origin="WAW", destination="BCN",
+                    depart_date="01/01/2027") is not None
+
+    # Median resists a past flash sale that would drag a mean down.
+    centre, _ = baseline([100.0, 100.0, 100.0, 100.0, 10.0])
+    assert centre == 100.0
+    assert round(baseline([100.0, 100.0, 100.0, 100.0, 10.0], "mean")[0], 1) == 82.0
+
+    # Zero/negative prices are junk, not data.
+    assert evaluate([0.0, -5.0, 100.0], 50.0, origin="WAW", destination="BCN",
+                    depart_date="01/01/2027") is None
+
+
+if __name__ == "__main__":
+    _self_check()
+    print("anomaly.py self-check ok")
